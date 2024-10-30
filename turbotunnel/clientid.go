@@ -15,6 +15,8 @@ import (
 // clients. ClientID implements the net.Addr interface.
 type ClientID [8]byte
 
+var DefaultClientID ClientID
+
 func NewClientID() ClientID {
 	var id ClientID
 	_, err := rand.Read(id[:])

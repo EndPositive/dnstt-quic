@@ -40,23 +40,28 @@ package main
 
 import (
 	"bytes"
+	"context"
+	"crypto/ed25519"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/base32"
-	"encoding/binary"
+	"encoding/pem"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
+	"math/big"
 	"net"
 	"os"
 	"sync"
 	"time"
 
-	"github.com/xtaci/kcp-go/v5"
-	"github.com/xtaci/smux"
+	"github.com/quic-go/quic-go"
+	"github.com/quic-go/quic-go/qlog"
+
 	"www.bamsoftware.com/git/dnstt.git/dns"
-	"www.bamsoftware.com/git/dnstt.git/noise"
 	"www.bamsoftware.com/git/dnstt.git/turbotunnel"
 )
 
@@ -101,102 +106,15 @@ var (
 // base32Encoding is a base32 encoding without padding.
 var base32Encoding = base32.StdEncoding.WithPadding(base32.NoPadding)
 
-// generateKeypair generates a private key and the corresponding public key. If
-// privkeyFilename and pubkeyFilename are respectively empty, it prints the
-// corresponding key to standard output; otherwise it saves the key to the given
-// file name. The private key is saved with mode 0400 and the public key is
-// saved with 0666 (before umask). In case of any error, it attempts to delete
-// any files it has created before returning.
-func generateKeypair(privkeyFilename, pubkeyFilename string) (err error) {
-	// Filenames to delete in case of error (avoid leaving partially written
-	// files).
-	var toDelete []string
-	defer func() {
-		for _, filename := range toDelete {
-			fmt.Fprintf(os.Stderr, "deleting partially written file %s\n", filename)
-			if closeErr := os.Remove(filename); closeErr != nil {
-				fmt.Fprintf(os.Stderr, "cannot remove %s: %v\n", filename, closeErr)
-				if err == nil {
-					err = closeErr
-				}
-			}
-		}
-	}()
-
-	privkey, err := noise.GeneratePrivkey()
-	if err != nil {
-		return err
-	}
-	pubkey := noise.PubkeyFromPrivkey(privkey)
-
-	if privkeyFilename != "" {
-		// Save the privkey to a file.
-		f, err := os.OpenFile(privkeyFilename, os.O_RDWR|os.O_CREATE, 0400)
-		if err != nil {
-			return err
-		}
-		toDelete = append(toDelete, privkeyFilename)
-		err = noise.WriteKey(f, privkey)
-		if err2 := f.Close(); err == nil {
-			err = err2
-		}
-		if err != nil {
-			return err
-		}
-	}
-
-	if pubkeyFilename != "" {
-		// Save the pubkey to a file.
-		f, err := os.Create(pubkeyFilename)
-		if err != nil {
-			return err
-		}
-		toDelete = append(toDelete, pubkeyFilename)
-		err = noise.WriteKey(f, pubkey)
-		if err2 := f.Close(); err == nil {
-			err = err2
-		}
-		if err != nil {
-			return err
-		}
-	}
-
-	// All good, allow the written files to remain.
-	toDelete = nil
-
-	if privkeyFilename != "" {
-		fmt.Printf("privkey written to %s\n", privkeyFilename)
-	} else {
-		fmt.Printf("privkey %x\n", privkey)
-	}
-	if pubkeyFilename != "" {
-		fmt.Printf("pubkey  written to %s\n", pubkeyFilename)
-	} else {
-		fmt.Printf("pubkey  %x\n", pubkey)
-	}
-
-	return nil
-}
-
-// readKeyFromFile reads a key from a named file.
-func readKeyFromFile(filename string) ([]byte, error) {
-	f, err := os.Open(filename)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-	return noise.ReadKey(f)
-}
-
 // handleStream bidirectionally connects a client stream with a TCP socket
 // addressed by upstream.
-func handleStream(stream *smux.Stream, upstream string, conv uint32) error {
+func handleStream(stream quic.Stream, upstream string) error {
 	dialer := net.Dialer{
 		Timeout: upstreamDialTimeout,
 	}
 	upstreamConn, err := dialer.Dial("tcp", upstream)
 	if err != nil {
-		return fmt.Errorf("stream %08x:%d connect upstream: %v", conv, stream.ID(), err)
+		return fmt.Errorf("stream :%d connect upstream: %v", stream.StreamID(), err)
 	}
 	defer upstreamConn.Close()
 	upstreamTCPConn := upstreamConn.(*net.TCPConn)
@@ -211,7 +129,7 @@ func handleStream(stream *smux.Stream, upstream string, conv uint32) error {
 			err = nil
 		}
 		if err != nil && !errors.Is(err, io.ErrClosedPipe) {
-			log.Printf("stream %08x:%d copy stream←upstream: %v", conv, stream.ID(), err)
+			log.Printf("stream :%d copy stream←upstream: %v", stream.StreamID(), err)
 		}
 		upstreamTCPConn.CloseRead()
 		stream.Close()
@@ -224,7 +142,7 @@ func handleStream(stream *smux.Stream, upstream string, conv uint32) error {
 			err = nil
 		}
 		if err != nil && !errors.Is(err, io.ErrClosedPipe) {
-			log.Printf("stream %08x:%d copy upstream←stream: %v", conv, stream.ID(), err)
+			log.Printf("stream :%d copy upstream←stream: %v", stream.StreamID(), err)
 		}
 		upstreamTCPConn.CloseWrite()
 	}()
@@ -235,41 +153,24 @@ func handleStream(stream *smux.Stream, upstream string, conv uint32) error {
 
 // acceptStreams wraps a KCP session in a Noise channel and an smux.Session,
 // then awaits smux streams. It passes each stream to handleStream.
-func acceptStreams(conn *kcp.UDPSession, privkey []byte, upstream string) error {
-	// Put a Noise channel on top of the KCP conn.
-	rw, err := noise.NewServer(conn, privkey)
-	if err != nil {
-		return err
-	}
-
-	// Put an smux session on top of the encrypted Noise channel.
-	smuxConfig := smux.DefaultConfig()
-	smuxConfig.Version = 2
-	smuxConfig.KeepAliveTimeout = idleTimeout
-	smuxConfig.MaxStreamBuffer = 1 * 1024 * 1024 // default is 65536
-	sess, err := smux.Server(rw, smuxConfig)
-	if err != nil {
-		return err
-	}
-	defer sess.Close()
-
+func acceptStreams(conn quic.Connection, upstream string) error {
 	for {
-		stream, err := sess.AcceptStream()
+		stream, err := conn.AcceptStream(context.Background())
 		if err != nil {
 			if err, ok := err.(net.Error); ok && err.Temporary() {
 				continue
 			}
 			return err
 		}
-		log.Printf("begin stream %08x:%d", conn.GetConv(), stream.ID())
+		log.Printf("begin stream :%d", stream.StreamID())
 		go func() {
 			defer func() {
-				log.Printf("end stream %08x:%d", conn.GetConv(), stream.ID())
+				log.Printf("end stream :%d", stream.StreamID())
 				stream.Close()
 			}()
-			err := handleStream(stream, upstream, conn.GetConv())
+			err := handleStream(stream, upstream)
 			if err != nil {
-				log.Printf("stream %08x:%d handleStream: %v", conn.GetConv(), stream.ID(), err)
+				log.Printf("stream :%d handleStream: %v", stream.StreamID(), err)
 			}
 		}()
 	}
@@ -277,77 +178,26 @@ func acceptStreams(conn *kcp.UDPSession, privkey []byte, upstream string) error 
 
 // acceptSessions listens for incoming KCP connections and passes them to
 // acceptStreams.
-func acceptSessions(ln *kcp.Listener, privkey []byte, mtu int, upstream string) error {
+func acceptSessions(ln *quic.Listener, upstream string) error {
 	for {
-		conn, err := ln.AcceptKCP()
+		conn, err := ln.Accept(context.Background())
 		if err != nil {
 			if err, ok := err.(net.Error); ok && err.Temporary() {
 				continue
 			}
 			return err
 		}
-		log.Printf("begin session %08x", conn.GetConv())
-		// Permit coalescing the payloads of consecutive sends.
-		conn.SetStreamMode(true)
-		// Disable the dynamic congestion window (limit only by the
-		// maximum of local and remote static windows).
-		conn.SetNoDelay(
-			0, // default nodelay
-			0, // default interval
-			0, // default resend
-			1, // nc=1 => congestion window off
-		)
-		conn.SetWindowSize(turbotunnel.QueueSize/2, turbotunnel.QueueSize/2)
-		if rc := conn.SetMtu(mtu); !rc {
-			panic(rc)
-		}
+		log.Printf("begin session")
 		go func() {
 			defer func() {
-				log.Printf("end session %08x", conn.GetConv())
-				conn.Close()
+				log.Printf("end session")
+				conn.CloseWithError(0x42, "I don't want to talk to you anymore 🙉")
 			}()
-			err := acceptStreams(conn, privkey, upstream)
+			err := acceptStreams(conn, upstream)
 			if err != nil && !errors.Is(err, io.ErrClosedPipe) {
-				log.Printf("session %08x acceptStreams: %v", conn.GetConv(), err)
+				log.Printf("session acceptStreams: %v", err)
 			}
 		}()
-	}
-}
-
-// nextPacket reads the next length-prefixed packet from r, ignoring padding. It
-// returns a nil error only when a packet was read successfully. It returns
-// io.EOF only when there were 0 bytes remaining to read from r. It returns
-// io.ErrUnexpectedEOF when EOF occurs in the middle of an encoded packet.
-//
-// The prefixing scheme is as follows. A length prefix L < 0xe0 means a data
-// packet of L bytes. A length prefix L >= 0xe0 means padding of L - 0xe0 bytes
-// (not counting the length of the length prefix itself).
-func nextPacket(r *bytes.Reader) ([]byte, error) {
-	// Convert io.EOF to io.ErrUnexpectedEOF.
-	eof := func(err error) error {
-		if err == io.EOF {
-			err = io.ErrUnexpectedEOF
-		}
-		return err
-	}
-
-	for {
-		prefix, err := r.ReadByte()
-		if err != nil {
-			// We may return a real io.EOF only here.
-			return nil, err
-		}
-		if prefix >= 224 {
-			paddingLen := prefix - 224
-			_, err := io.CopyN(ioutil.Discard, r, int64(paddingLen))
-			if err != nil {
-				return nil, eof(err)
-			}
-		} else {
-			p := make([]byte, int(prefix))
-			_, err = io.ReadFull(r, p)
-			return p, eof(err)
-		}
 	}
 }
 
@@ -518,33 +368,11 @@ func recvLoop(domain dns.Name, dnsConn net.PacketConn, ttConn *turbotunnel.Queue
 		}
 
 		resp, payload := responseFor(&query, domain)
-		// Extract the ClientID from the payload.
-		var clientID turbotunnel.ClientID
-		n = copy(clientID[:], payload)
-		payload = payload[n:]
-		if n == len(clientID) {
-			// Discard padding and pull out the packets contained in
-			// the payload.
-			r := bytes.NewReader(payload)
-			for {
-				p, err := nextPacket(r)
-				if err != nil {
-					break
-				}
-				// Feed the incoming packet to KCP.
-				ttConn.QueueIncoming(p, clientID)
-			}
-		} else {
-			// Payload is not long enough to contain a ClientID.
-			if resp != nil && resp.Rcode() == dns.RcodeNoError {
-				resp.Flags |= dns.RcodeNameError
-				log.Printf("NXDOMAIN: %d bytes are too short to contain a ClientID", n)
-			}
-		}
+		ttConn.QueueIncoming(payload, turbotunnel.DefaultClientID)
 		// If a response is called for, pass it to sendLoop via the channel.
 		if resp != nil {
 			select {
-			case ch <- &record{resp, addr, clientID}:
+			case ch <- &record{resp, addr, turbotunnel.DefaultClientID}:
 			default:
 			}
 		}
@@ -585,70 +413,33 @@ func sendLoop(dnsConn net.PacketConn, ttConn *turbotunnel.QueuePacketConn, ch <-
 				},
 			}
 
-			var payload bytes.Buffer
-			limit := maxEncodedPayload
-			// We loop and bundle as many packets from OutgoingQueue
-			// into the response as will fit. Any packet that would
-			// overflow the capacity of the DNS response, we stash
-			// to be bundled into a future response.
 			timer := time.NewTimer(maxResponseDelay)
-			for {
-				var p []byte
-				unstash := ttConn.Unstash(rec.ClientID)
-				outgoing := ttConn.OutgoingQueue(rec.ClientID)
-				// Prioritize taking a packet first from the
-				// stash, then from the outgoing queue, then
-				// finally check for the expiration of the timer
-				// or for a receive on ch (indicating a new
-				// query that we must respond to).
-				select {
-				case p = <-unstash:
-				default:
-					select {
-					case p = <-unstash:
-					case p = <-outgoing:
-					default:
-						select {
-						case p = <-unstash:
-						case p = <-outgoing:
-						case <-timer.C:
-						case nextRec = <-ch:
-						}
-					}
-				}
-				// We wait for the first packet in a bundle
-				// only. The second and later packets must be
-				// immediately available or they will be omitted
-				// from this bundle.
-				timer.Reset(0)
-
-				if len(p) == 0 {
-					// timer expired or receive on ch, we
-					// are done with this response.
-					break
-				}
-
-				limit -= 2 + len(p)
-				if payload.Len() == 0 {
-					// No packet length check for the first
-					// packet; if it's too large, we allow
-					// it to be truncated and dropped by the
-					// receiver.
-				} else if limit < 0 {
-					// Stash this packet to send in the next
-					// response.
-					ttConn.Stash(p, rec.ClientID)
-					break
-				}
-				if int(uint16(len(p))) != len(p) {
-					panic(len(p))
-				}
-				binary.Write(&payload, binary.BigEndian, uint16(len(p)))
-				payload.Write(p)
+			var p []byte
+			outgoing := ttConn.OutgoingQueue(rec.ClientID)
+			select {
+			case p = <-outgoing:
+			case <-timer.C:
+			case nextRec = <-ch:
 			}
+
+			if len(p) == 0 || p == nil {
+				// timer expired or receive on ch, we
+				// are done with this response.
+				continue
+			}
+
+			if len(p) > maxEncodedPayload {
+				fmt.Printf("len(p) > maxEncodedPayload, skipping payload: %d > %d\n", len(p), maxEncodedPayload)
+				break
+			}
+
+			if int(uint16(len(p))) != len(p) {
+				panic(len(p))
+			}
+
 			timer.Stop()
 
-			rec.Resp.Answer[0].Data = dns.EncodeRDataTXT(payload.Bytes())
+			rec.Resp.Answer[0].Data = p
 		}
 
 		buf, err := rec.Resp.WireFormat()
@@ -750,7 +541,7 @@ func computeMaxEncodedPayload(limit int) int {
 	high := 32768
 	for low+1 < high {
 		mid := (low + high) / 2
-		resp.Answer[0].Data = dns.EncodeRDataTXT(make([]byte, mid))
+		resp.Answer[0].Data = make([]byte, mid)
 		buf, err := resp.WireFormat()
 		if err != nil {
 			panic(err)
@@ -765,10 +556,8 @@ func computeMaxEncodedPayload(limit int) int {
 	return low
 }
 
-func run(privkey []byte, domain dns.Name, upstream string, dnsConn net.PacketConn) error {
+func run(domain dns.Name, upstream string, dnsConn net.PacketConn) error {
 	defer dnsConn.Close()
-
-	log.Printf("pubkey %x", noise.PubkeyFromPrivkey(privkey))
 
 	// We have a variable amount of room in which to encode downstream
 	// packets in each response, because each response must contain the
@@ -790,13 +579,26 @@ func run(privkey []byte, domain dns.Name, upstream string, dnsConn net.PacketCon
 
 	// Start up the virtual PacketConn for turbotunnel.
 	ttConn := turbotunnel.NewQueuePacketConn(turbotunnel.DummyAddr{}, idleTimeout*2)
-	ln, err := kcp.ServeConn(nil, 0, 0, ttConn)
+
+	tr := quic.Transport{
+		Conn: ttConn,
+	}
+
+	tlsConf := generateTLSConfig()
+
+	quicConf := &quic.Config{
+		InitialPacketSize:       uint16(mtu),
+		DisablePathMTUDiscovery: true,
+		Tracer:                  qlog.DefaultConnectionTracer,
+	}
+
+	ln, err := tr.Listen(tlsConf, quicConf)
 	if err != nil {
-		return fmt.Errorf("opening KCP listener: %v", err)
+		return fmt.Errorf("opening listener: %v", err)
 	}
 	defer ln.Close()
 	go func() {
-		err := acceptSessions(ln, privkey, mtu, upstream)
+		err := acceptSessions(ln, upstream)
 		if err != nil {
 			log.Printf("acceptSessions: %v", err)
 		}
@@ -819,10 +621,6 @@ func run(privkey []byte, domain dns.Name, upstream string, dnsConn net.PacketCon
 }
 
 func main() {
-	var genKey bool
-	var privkeyFilename string
-	var privkeyString string
-	var pubkeyFilename string
 	var udpAddr string
 
 	flag.Usage = func() {
@@ -837,27 +635,13 @@ Example:
 `, os.Args[0])
 		flag.PrintDefaults()
 	}
-	flag.BoolVar(&genKey, "gen-key", false, "generate a server keypair; print to stdout or save to files")
 	flag.IntVar(&maxUDPPayload, "mtu", maxUDPPayload, "maximum size of DNS responses")
-	flag.StringVar(&privkeyString, "privkey", "", fmt.Sprintf("server private key (%d hex digits)", noise.KeyLen*2))
-	flag.StringVar(&privkeyFilename, "privkey-file", "", "read server private key from file (with -gen-key, write to file)")
-	flag.StringVar(&pubkeyFilename, "pubkey-file", "", "with -gen-key, write server public key to file")
 	flag.StringVar(&udpAddr, "udp", "", "UDP address to listen on (required)")
 	flag.Parse()
 
 	log.SetFlags(log.LstdFlags | log.LUTC)
 
-	if genKey {
-		// -gen-key mode.
-		if flag.NArg() != 0 || privkeyString != "" || udpAddr != "" {
-			flag.Usage()
-			os.Exit(1)
-		}
-		if err := generateKeypair(privkeyFilename, pubkeyFilename); err != nil {
-			fmt.Fprintf(os.Stderr, "cannot generate keypair: %v\n", err)
-			os.Exit(1)
-		}
-	} else {
+	{
 		// Ordinary server mode.
 		if flag.NArg() != 2 {
 			flag.Usage()
@@ -908,44 +692,62 @@ Example:
 			os.Exit(1)
 		}
 
-		if pubkeyFilename != "" {
-			fmt.Fprintf(os.Stderr, "-pubkey-file may only be used with -gen-key\n")
-			os.Exit(1)
-		}
-
-		var privkey []byte
-		if privkeyFilename != "" && privkeyString != "" {
-			fmt.Fprintf(os.Stderr, "only one of -privkey and -privkey-file may be used\n")
-			os.Exit(1)
-		} else if privkeyFilename != "" {
-			var err error
-			privkey, err = readKeyFromFile(privkeyFilename)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "cannot read privkey from file: %v\n", err)
-				os.Exit(1)
-			}
-		} else if privkeyString != "" {
-			var err error
-			privkey, err = noise.DecodeKey(privkeyString)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "privkey format error: %v\n", err)
-				os.Exit(1)
-			}
-		}
-		if len(privkey) == 0 {
-			log.Println("generating a temporary one-time keypair")
-			log.Println("use the -privkey or -privkey-file option for a persistent server keypair")
-			var err error
-			privkey, err = noise.GeneratePrivkey()
-			if err != nil {
-				fmt.Fprintln(os.Stderr, err)
-				os.Exit(1)
-			}
-		}
-
-		err = run(privkey, domain, upstream, dnsConn)
+		err = run(domain, upstream, dnsConn)
 		if err != nil {
 			log.Fatal(err)
 		}
+	}
+}
+
+func generateTLSConfig() *tls.Config {
+	// Generate an Ed25519 private key
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		panic(fmt.Sprintf("Failed to generate Ed25519 key: %v", err))
+	}
+
+	// Create a simple certificate template
+	template := x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		NotBefore:    time.Now(),
+		NotAfter:     time.Now().Add(365 * 24 * time.Hour), // 1 year
+		KeyUsage:     x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	}
+
+	// Self-sign the certificate
+	certDER, err := x509.CreateCertificate(rand.Reader, &template, &template, pub, priv)
+	if err != nil {
+		panic(fmt.Sprintf("Failed to create certificate: %v", err))
+	}
+
+	encoded, err := x509.MarshalPKCS8PrivateKey(priv)
+	if err != nil {
+		panic(fmt.Sprintf("Failed to marshal private key: %v", err))
+	}
+
+	// Encode the private key as PEM
+	keyPEM := pem.EncodeToMemory(&pem.Block{
+		Type:  "PRIVATE KEY",
+		Bytes: encoded,
+	})
+
+	// Encode the certificate as PEM
+	certPEM := pem.EncodeToMemory(&pem.Block{
+		Type:  "CERTIFICATE",
+		Bytes: certDER,
+	})
+
+	// Load the certificate and key into tls.Certificate
+	tlsCert, err := tls.X509KeyPair(certPEM, keyPEM)
+	if err != nil {
+		panic(fmt.Sprintf("Failed to load key pair: %v", err))
+	}
+
+	// Return the TLS config
+	return &tls.Config{
+		Certificates: []tls.Certificate{tlsCert},
+		NextProtos:   []string{"quic-echo-example"},
+		MinVersion:   tls.VersionTLS13, // Use TLS 1.3
 	}
 }
