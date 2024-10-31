@@ -87,9 +87,9 @@ func NewName(labels [][]byte) (Name, error) {
 	// Check the total length.
 	builder := newMessageBuilder()
 	builder.WriteName(name)
-	if len(builder.Bytes()) > 255 {
-		return nil, ErrNameTooLong
-	}
+	//if len(builder.Bytes()) > 255 {
+	//	return nil, ErrNameTooLong
+	//}
 	return name, nil
 }
 
